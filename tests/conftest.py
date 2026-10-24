@@ -1,8 +1,10 @@
 from dataclasses import replace
 
 import pytest
+import pytest_asyncio
 
 from app.config import Settings
+from app.db import Database
 
 
 class FakeClock:
@@ -33,3 +35,11 @@ def settings(tmp_path) -> Settings:
         heartbeat_s=0.01,
         llm_timeout_s=0.2,
     )
+
+
+@pytest_asyncio.fixture
+async def db(settings):
+    database = await Database.connect(settings.db_path)
+    await database.create_schema()
+    yield database
+    await database.close()

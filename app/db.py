@@ -5,7 +5,7 @@ from enum import Enum
 
 import aiosqlite
 
-from app.schemas import TicketIn
+from app.schemas import Classification, TicketIn
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tickets (
@@ -154,3 +154,124 @@ class Database:
         ) as cur:
             rows = await cur.fetchall()
         return [_to_ticket(r) for r in rows]
+
+    # ---- queue operations -------------------------------------------------
+    # Every method taking `token` is fenced on (id, held_by): the token is
+    # unique per claim, so a holder whose lease expired and was re-claimed
+    # by someone else changes nothing. True only if exactly one row changed.
+
+    async def _fenced(self, sql: str, params: tuple[object, ...]) -> bool:
+        cur = await self._conn.execute(sql, params)
+        changed = cur.rowcount == 1
+        await cur.close()
+        return changed
+
+    async def claim_next(
+        self, *, token: str, now: float, lease_s: float, max_attempts: int
+    ) -> TicketRow | None:
+        # One atomic statement: SQLite takes the write lock before running the
+        # subquery, so two claimers (even on separate connections) can't both
+        # pick the same row.
+        async with self._conn.execute(
+            "UPDATE tickets SET held_by = :token, held_until = :now + :lease, "
+            "attempts = attempts + 1, updated_at = :now "
+            "WHERE id = ("
+            "  SELECT id FROM tickets"
+            "  WHERE status = 'pending'"
+            "    AND (held_until IS NULL OR held_until < :now)"
+            "    AND (next_attempt_at IS NULL OR next_attempt_at <= :now)"
+            "    AND attempts < :max"
+            "  ORDER BY created_at, id LIMIT 1"
+            ") RETURNING *",
+            {"token": token, "now": now, "lease": lease_s, "max": max_attempts},
+        ) as cur:
+            rows = await cur.fetchall()
+        return _to_ticket(rows[0]) if rows else None
+
+    async def renew(
+        self, ticket_id: str, token: str, *, now: float, lease_s: float
+    ) -> bool:
+        return await self._fenced(
+            "UPDATE tickets SET held_until = ?, updated_at = ? "
+            "WHERE id = ? AND held_by = ?",
+            (now + lease_s, now, ticket_id, token),
+        )
+
+    async def save_classified(
+        self,
+        ticket_id: str,
+        token: str,
+        c: Classification,
+        *,
+        prompt_version: int,
+        now: float,
+    ) -> bool:
+        return await self._fenced(
+            "UPDATE tickets SET status = 'classified', category = ?, "
+            "priority = ?, summary = ?, prompt_version = ?, held_by = NULL, "
+            "held_until = NULL, next_attempt_at = NULL, last_error = NULL, "
+            "updated_at = ? WHERE id = ? AND held_by = ?",
+            (
+                c.category,
+                c.priority,
+                c.summary,
+                prompt_version,
+                now,
+                ticket_id,
+                token,
+            ),
+        )
+
+    async def release_for_retry(
+        self,
+        ticket_id: str,
+        token: str,
+        *,
+        next_attempt_at: float,
+        error: str,
+        now: float,
+    ) -> bool:
+        return await self._fenced(
+            "UPDATE tickets SET held_by = NULL, held_until = NULL, "
+            "next_attempt_at = ?, last_error = ?, updated_at = ? "
+            "WHERE id = ? AND held_by = ?",
+            (next_attempt_at, error, now, ticket_id, token),
+        )
+
+    async def mark_failed(
+        self, ticket_id: str, token: str, *, error: str, now: float
+    ) -> bool:
+        return await self._fenced(
+            "UPDATE tickets SET status = 'failed', category = NULL, "
+            "priority = NULL, summary = NULL, prompt_version = NULL, "
+            "last_error = ?, held_by = NULL, held_until = NULL, "
+            "next_attempt_at = NULL, updated_at = ? "
+            "WHERE id = ? AND held_by = ?",
+            (error, now, ticket_id, token),
+        )
+
+    async def release_on_shutdown(
+        self, ticket_id: str, token: str, *, now: float
+    ) -> bool:
+        # The interrupted attempt never finished, so it is given back.
+        return await self._fenced(
+            "UPDATE tickets SET held_by = NULL, held_until = NULL, "
+            "attempts = attempts - 1, updated_at = ? "
+            "WHERE id = ? AND held_by = ?",
+            (now, ticket_id, token),
+        )
+
+    async def sweep_exhausted(self, *, now: float, max_attempts: int) -> int:
+        # Not fenced: it targets rows whose holder died during the final
+        # attempt, which claim_next will never pick up again.
+        cur = await self._conn.execute(
+            "UPDATE tickets SET status = 'failed', "
+            "last_error = 'worker stopped during final attempt', "
+            "held_by = NULL, held_until = NULL, updated_at = :now "
+            "WHERE status = 'pending' AND attempts >= :max "
+            "AND held_until IS NOT NULL AND held_until < :now",
+            {"now": now, "max": max_attempts},
+        )
+        count = cur.rowcount
+        await cur.close()
+        return count

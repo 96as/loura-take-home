@@ -1,19 +1,9 @@
 import asyncio
 
-import pytest_asyncio
-
-from app.db import Database, InsertResult
+from app.db import InsertResult
 from app.schemas import TicketIn
 
 NOW = 1_700_000_000.0
-
-
-@pytest_asyncio.fixture
-async def db(settings):
-    database = await Database.connect(settings.db_path)
-    await database.create_schema()
-    yield database
-    await database.close()
 
 
 def ticket(id_="t1", subject="Hello", body="Body text") -> TicketIn:
