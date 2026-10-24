@@ -24,8 +24,9 @@ _TICKET_CLOSE = "\n</ticket>"
 
 def extract_ticket(prompt: str) -> tuple[str, str]:
     """Return (subject, body) from the block that classifier.build_prompt appends."""
-    # The instruction text mentions <ticket> literally, so anchor on the last real block.
-    anchor = prompt.rfind(_TICKET_OPEN)
+    # The block comes after the instructions, and the instructions never contain the full
+    # opener; anchoring on the first one keeps a ticket body that mimics it from winning.
+    anchor = prompt.find(_TICKET_OPEN)
     if anchor == -1:
         raise ValueError("no <ticket> block in prompt")
     subject_start = anchor + len(_TICKET_OPEN)
@@ -46,9 +47,10 @@ _CATEGORY_KEYWORDS = (
     ("technical", ("error", "500", "api", "timeout", "export", "upload")),
     ("account", ("password", "log in", "email address", "account")),
 )
+# "low" is checked first: "not urgent" contains "urgent".
 _PRIORITY_KEYWORDS = (
-    ("high", ("urgent", "production", "blocking", "asap")),
     ("low", ("nice to have", "not urgent", "feature request")),
+    ("high", ("urgent", "production", "blocking", "asap")),
 )
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
 
