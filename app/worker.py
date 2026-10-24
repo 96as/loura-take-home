@@ -85,8 +85,9 @@ async def _retry_or_fail(
 ) -> bool:
     now = ctx.clock()
     if row.attempts >= ctx.settings.max_attempts:
-        # Final attempt: releasing it would leave a capped, unheld pending row
-        # that neither the claim nor the sweep would ever touch again.
+        # Final attempt: fail now with the real reason. Releasing would leave a
+        # capped, unheld pending row that is never claimed again; the sweep
+        # would only fail it later with a generic "attempt limit reached".
         logger.warning("ticket %s: failed after %d attempts: %s", row.id, row.attempts, error)
         return await ctx.db.mark_failed(row.id, token, error=error, now=now)
     delay = backoff_seconds(row.attempts, ctx.rng)
@@ -161,7 +162,7 @@ async def run_once(ctx: WorkerContext) -> bool:
     s = ctx.settings
     swept = await ctx.db.sweep_exhausted(now=ctx.clock(), max_attempts=s.max_attempts)
     if swept:
-        logger.warning("marked %d abandoned final-attempt ticket(s) failed", swept)
+        logger.warning("marked %d ticket(s) stuck at the attempt cap failed", swept)
     token = uuid.uuid4().hex
     row = await ctx.db.claim_next(
         token=token, now=ctx.clock(), lease_s=s.lease_s, max_attempts=s.max_attempts

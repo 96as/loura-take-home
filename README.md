@@ -160,7 +160,7 @@ save for a lost lease.
 
 **Sweep.** A ticket that is pending, at the attempt cap and not under a live lease can never be
 claimed again. That happens if a worker dies during the final attempt, or if a restart lowers
-`MAX_ATTEMPTS` below the attempts a released ticket already used. Each poll marks such tickets
+`MAX_ATTEMPTS` to or below the number of attempts a released ticket has already used. Each poll marks such tickets
 `failed` (`last_error = "worker stopped during final attempt"` when the lease expired,
 `"attempt limit reached"` when it was already released), so nothing stays pending forever.
 
