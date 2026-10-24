@@ -27,9 +27,16 @@ Reply with JSON only, for example:
 """
 
 
+def _strip_closing_tags(text: str) -> str:
+    # Repeat until stable: removing one tag can splice its neighbours into a new one.
+    while _CLOSING_TAG.search(text):
+        text = _CLOSING_TAG.sub("", text)
+    return text
+
+
 def build_prompt(subject: str, body: str) -> str:
-    subject = _CLOSING_TAG.sub("", subject)
-    body = _CLOSING_TAG.sub("", body)
+    subject = _strip_closing_tags(subject)
+    body = _strip_closing_tags(body)
     return f"{_INSTRUCTIONS}\n<ticket>\nsubject: {subject}\nbody:\n{body}\n</ticket>"
 
 
@@ -53,13 +60,24 @@ def _extract_object(text: str) -> dict:
     raise InvalidReply("not JSON")
 
 
+_MAX_ECHO_CHARS = 30
+
+
+def _echo(value: object) -> str:
+    """Render a model-supplied value for a reason, capped so last_error stays short."""
+    text = json.dumps(value, ensure_ascii=False)
+    if len(text) > _MAX_ECHO_CHARS:
+        text = text[: _MAX_ECHO_CHARS - 1] + "…"
+    return text
+
+
 def _reason(err: ValidationError) -> str:
     e = err.errors()[0]
     field = str(e["loc"][0]) if e["loc"] else "reply"
     if e["type"] == "missing":
         return f'missing field "{field}"'
     if e["type"] == "literal_error":
-        return f"{field} {json.dumps(e['input'])} not allowed"
+        return f"{field} {_echo(e['input'])} not allowed"
     if e["type"] == "string_type":
         return f"{field} must be a string"
     return str(e["msg"]).removeprefix("Value error, ")
