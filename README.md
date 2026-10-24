@@ -28,11 +28,11 @@ The workers start with the server, so tickets get classified within a few second
 With the default fake failure rate of 25%, some tickets need a retry (`attempts` above 1)
 and now and then one ends up `failed` with a `last_error`. That is intended: it shows the
 failure paths working. A fake "hang" holds a ticket for about 20 s (the timeout) before its
-retry, so give it ~30 s to settle. The server log shows only warnings (final failures, lost
-leases); retries are logged at INFO, which is not printed because no logging is configured.
+retry, so give it ~30 s to settle. The server log shows what the workers do: each retry
+with its reason and wait, final failures, lost leases and tickets released on shutdown.
 For a clean run, start the server with `FAKE_LLM_FAILURE_RATE=0 uvicorn app.main:app`.
 
-Run the tests (126 of them, a few seconds, no server needed):
+Run the test suite (a few seconds, no server needed):
 
 ```bash
 pytest -q
@@ -79,7 +79,7 @@ curl -s -X POST http://127.0.0.1:8000/tickets/reclassify \
 }
 ```
 
-Yes, the fake model obeyed the attacker. See [Prompt injection](#prompt-injection) for why
+Yes, the fake model went along with the attacker. See [Prompt injection](#prompt-injection) for why
 that is shown rather than hidden.
 
 ### Settings (environment variables)
@@ -94,7 +94,7 @@ that is shown rather than hidden.
 | `LLM_TIMEOUT_S` | `20` | Timeout for one LLM call |
 | `MAX_ATTEMPTS` | `3` | Attempts per ticket before it is `failed` |
 | `FAKE_LLM_FAILURE_RATE` | `0.25` | Share of fake replies that are broken in some way |
-| `FAKE_LLM_SEED` | unset (random) | Makes the fake (and retry jitter) repeatable |
+| `FAKE_LLM_SEED` | unset (random) | Seeds the fake and the retry jitter; with several workers it fixes the random sequence, not which ticket gets which draw |
 
 ## Where things are
 
@@ -158,9 +158,11 @@ save for a lost lease.
 3. No guessing: `urgent` is rejected, not mapped to `high`. There are no fallback labels. A
    ticket that runs out of attempts is `failed` with NULL labels and a `last_error` that says why.
 
-**Sweep.** If a worker dies during the final attempt, its ticket is pending, at the cap, and
-no longer claimable. Each poll also marks such tickets `failed` once their lease has expired
-(`last_error = "worker stopped during final attempt"`), so nothing stays pending forever.
+**Sweep.** A ticket that is pending, at the attempt cap and not under a live lease can never be
+claimed again. That happens if a worker dies during the final attempt, or if a restart lowers
+`MAX_ATTEMPTS` below the attempts a released ticket already used. Each poll marks such tickets
+`failed` (`last_error = "worker stopped during final attempt"` when the lease expired,
+`"attempt limit reached"` when it was already released), so nothing stays pending forever.
 
 **Tests** use an injected clock and a `ScriptedLLM` that replays fixed replies and errors, so
 lease expiry and backoff are tested without sleeping and no test depends on luck.
@@ -201,12 +203,15 @@ but that is only tested within one process (see weaknesses).
 
 - **Normal stop** (Ctrl+C / SIGTERM): each worker cancels its in-flight LLM call and does a
   fenced release of its ticket: lease cleared and the attempt given back (`attempts - 1`).
-  The ticket is picked up again right after the next start, and restarts don't burn attempts.
-  The in-flight call is abandoned and redone, not finished.
+  The ticket is picked up again right after the next start, so a normal stop gives back the
+  attempt of an in-flight LLM call. (Tiny windows during a claim or a result write can still
+  cost one attempt; the lease then expires as usual.) The in-flight call is abandoned and
+  redone, not finished.
 - **Crash** (kill -9, power loss): the lease simply expires within 30 s and another worker
   re-claims the ticket. The crashed attempt still counts. That is deliberate: a ticket that
   crashes the process every time (a poison pill) fails after 3 tries instead of looping
-  forever. If the crash happened on the final attempt, the sweep marks the ticket `failed`.
+  forever. If the crash happened on the final attempt, the sweep (see How it works) marks the
+  ticket `failed`.
 - Retry waits are stored in the database (`next_attempt_at`), so they survive restarts too.
 
 ### Retry policy and how a ticket ends up `failed`
@@ -217,7 +222,7 @@ but that is only tested within one process (see weaknesses).
 - Not retryable: `LLMPermanentError` (request rejected) fails the ticket at once.
 - Backoff: about 2 s before attempt 2 and about 8 s before attempt 3, each with ±20% jitter.
 - A ticket becomes `failed` after a permanent error, after a retryable failure on its third
-  attempt, or through the sweep when a worker died during the third attempt. A failed ticket
+  attempt, or through the sweep (see How it works). A failed ticket
   has NULL labels, its `attempts`, and a short `last_error` (for example
   `invalid reply: priority "critical" not allowed`).
 - Failed tickets can be re-queued with `POST /tickets/reclassify` (see below).
@@ -230,8 +235,8 @@ with a guess: no answer is better than an invented one.
 
 What is done, from most to least important:
 
-1. **The model has no power.** Its output is three fields from fixed sets (plus a short
-   summary string). Nothing acts on them: there are no tools, no refunds, no emails. The worst
+1. **The model has no power.** Its output is two fields from fixed sets plus a short
+   summary string. Nothing acts on them: there are no tools, no refunds, no emails. The worst
    an attacker can do is get their own ticket mislabelled. This is the main defence.
 2. **Strict validation** means an injected reply can't put anything outside those sets into
    the database.
@@ -244,9 +249,10 @@ What is done, from most to least important:
    `app/injection.py`), the ticket gets `suspected_injection: true`. This is a hint for a human,
    not a defence: classification still runs and the flag is shown in every response.
 
-The fake model is gullible on purpose: on t-1005 it does what the attacker asks
-(`technical` / `high` / "Approved for immediate refund."). The reply is valid, so validation
-can't catch it. The flag is what tells a human to look.
+The fake model is gullible on purpose: when the phrase check matches, it returns a fixed
+reply (`technical` / `high` / "Approved for immediate refund."), which are the labels t-1005
+asks for, not whatever an attacker might ask. The reply is valid, so validation can't catch
+it. The flag is what tells a human to look.
 
 ### API shape
 
@@ -271,10 +277,7 @@ can't catch it. The flag is what tells a human to look.
   last_error, suspected_injection, created_at, updated_at`. The lease fields,
   `next_attempt_at` and `prompt_version` are internal and not returned.
 - **No authentication** on any endpoint. That was an explicit non-goal for this exercise.
-  `POST /tickets/reclassify` in particular is a bulk operator action. In production it should
-  sit behind an admin token, an internal-only router, or be a CLI. Each call resets `attempts`
-  to 0 on the tickets it re-queues, so anyone who can call it repeatedly can get around the
-  cap of 3 model calls per ticket.
+  The risk it creates for `POST /tickets/reclassify` is described under Re-classify.
 - No `/v1` prefix and no health endpoint (see "With more time").
 
 ### Re-classify (the stretch goal I picked)
@@ -289,6 +292,11 @@ are never touched, `suspected_injection` is kept, and calling it twice is harmle
 
 The old labels are not kept visible while the re-run is in progress. That keeps the lifecycle
 simple, at the cost described under weaknesses.
+
+It is a bulk operator action and, like every endpoint, has no authentication. Each call resets
+`attempts` to 0 on the tickets it re-queues, so anyone who can call it repeatedly can get
+around the cap of 3 model calls per ticket. In production it should sit behind an admin
+token, an internal-only router, or be a CLI.
 
 ## The LLM is a fake, on purpose
 
@@ -316,9 +324,11 @@ it instead returns one of these, picked at random:
 | raises `LLMPermanentError` | ticket fails at once |
 
 It is also **gullible to injection on purpose**: if the ticket contains one of the injection
-phrases, it obeys and returns the attacker's labels, to show that a valid-but-wrong answer gets
-through validation. Its randomness comes from one seeded RNG (`FAKE_LLM_SEED`); lifecycle
-tests use `ScriptedLLM` instead.
+phrases, it returns a fixed reply (`technical` / `high` / "Approved for immediate refund.",
+the labels t-1005 asks for), to show that a valid-but-wrong answer gets through validation.
+Its randomness comes from one seeded RNG (`FAKE_LLM_SEED`), which with several workers fixes
+the random sequence but not which ticket gets which draw; lifecycle tests use `ScriptedLLM`
+instead.
 
 **What a real adapter changes.** One new file in `app/llm/` with a class that has
 `async complete(prompt) -> str`, passed to `create_app` in `app/main.py`. It would:
@@ -372,10 +382,10 @@ result is stored, once.
 - **Re-classifying a stale ticket can lose its good labels.** Its labels are cleared when it is
   re-queued; if all three re-run attempts fail, it ends `failed` with no labels. Accepted to
   keep the lifecycle simple; it can be re-queued again.
-- **Unrestricted re-classify bypasses the cost cap.** No auth, and each call resets attempts.
+- **Unrestricted re-classify bypasses the cost cap.** See Re-classify.
 - **The injection flag is a phrase list.** Rephrasings get past it, and an innocent ticket that
   quotes one of the phrases gets flagged.
-- **A valid but wrong answer passes validation.** An obeyed injection, or simply a wrong
+- **A valid but wrong answer passes validation.** A reply that went along with an injection, or simply a wrong
   label, looks exactly like a right one. Only an evaluation set or a human would catch it.
 - **Filtered pagination is not a snapshot.** New arrivals don't cause repeats or gaps, but if
   a ticket's status or labels change between pages (it gets classified, or re-classified), it
@@ -385,6 +395,5 @@ result is stored, once.
 - **`updated_at` moves on claim and heartbeat**, not only when the ticket visibly changes.
 - **One SQLite connection per process**, shared by the API and the workers, so database calls
   are serialized. Fine at this scale.
-- **Logging is bare.** No logging config, so only warnings and errors are printed; there are
-  no metrics.
+- **Plain stdlib text logs;** no structured logging or metrics.
 - **Only direct dependencies are pinned** in `requirements.txt`; transitive ones float.
