@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
 import aiosqlite
 
@@ -271,6 +272,32 @@ class Database:
             "WHERE status = 'pending' AND attempts >= :max "
             "AND held_until IS NOT NULL AND held_until < :now",
             {"now": now, "max": max_attempts},
+        )
+        count = cur.rowcount
+        await cur.close()
+        return count
+
+    async def reclassify(
+        self,
+        target: Literal["failed", "stale_prompt"],
+        *,
+        current_prompt_version: int,
+        now: float,
+    ) -> int:
+        # Re-queueing is one UPDATE: the workers' normal claim picks the rows
+        # up again. Only failed/classified rows can match, so pending rows
+        # (held or not) are never touched. `IS NOT` makes a NULL prompt_version
+        # count as stale. suspected_injection is kept: it describes the input.
+        if target == "failed":
+            where = "status = 'failed'"
+        else:
+            where = "status = 'classified' AND prompt_version IS NOT :v"
+        cur = await self._conn.execute(
+            "UPDATE tickets SET status = 'pending', attempts = 0, "
+            "last_error = NULL, category = NULL, priority = NULL, "
+            "summary = NULL, prompt_version = NULL, next_attempt_at = NULL, "
+            f"held_by = NULL, held_until = NULL, updated_at = :now WHERE {where}",
+            {"now": now, "v": current_prompt_version},
         )
         count = cur.rowcount
         await cur.close()

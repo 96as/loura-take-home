@@ -14,9 +14,19 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.classifier import PROMPT_VERSION
 from app.db import InsertResult, TicketRow
 from app.injection import looks_like_injection
-from app.schemas import Category, Priority, Status, TicketIn, TicketOut, TicketPage
+from app.schemas import (
+    Category,
+    Priority,
+    ReclassifyIn,
+    ReclassifyOut,
+    Status,
+    TicketIn,
+    TicketOut,
+    TicketPage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +164,15 @@ async def create_ticket(ticket: TicketIn, request: Request, response: Response) 
     if result is InsertResult.DUPLICATE:
         response.status_code = 200
     return to_ticket_out(row)
+
+
+@router.post("/tickets/reclassify", response_model=ReclassifyOut, status_code=202)
+async def reclassify_tickets(body: ReclassifyIn, request: Request) -> ReclassifyOut:
+    state = request.app.state
+    queued = await state.db.reclassify(
+        body.target, current_prompt_version=PROMPT_VERSION, now=state.clock()
+    )
+    return ReclassifyOut(queued=queued)
 
 
 @router.get("/tickets/{ticket_id}", response_model=TicketOut)
