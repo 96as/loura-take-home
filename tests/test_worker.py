@@ -1,10 +1,11 @@
 import asyncio
 import json
+import logging
 import random
 from dataclasses import replace
 
 from app.db import InsertResult
-from app.llm.base import LLMPermanentError
+from app.llm.base import LLMPermanentError, LLMTransientError
 from app.llm.fake import ScriptedLLM
 from app.schemas import TicketIn
 from app.worker import (
@@ -152,29 +153,116 @@ async def test_timeout_is_retryable(db, settings, clock):
     assert row.next_attempt_at > clock()
 
 
-async def test_lost_lease_discards_result(db, settings, clock):
+async def test_transient_error_is_retryable(db, settings, clock):
     await add(db, clock)
-    finished = []
-
-    async def stolen_then_valid(prompt):
-        await steal(db)
-        # Shorter than llm_timeout_s, far longer than heartbeat_s: the heartbeat
-        # notices the loss first and cancels this call.
-        await asyncio.sleep(0.1)
-        finished.append(True)
-        return VALID
-
-    ctx, _ = make_ctx(db, settings, clock, [stolen_then_valid])
+    ctx, _ = make_ctx(db, settings, clock, [LLMTransientError("upstream 503")])
 
     assert await run_once(ctx) is True
 
     row = await db.get_ticket("t1")
     assert row.status == "pending"
+    assert row.attempts == 1
+    assert row.last_error == "llm transient error: upstream 503"
+    assert row.held_by is None
+    assert clock() + 1.6 <= row.next_attempt_at <= clock() + 2.4
+
+
+async def test_timeout_on_final_attempt_fails(db, settings, clock):
+    await add(db, clock)
+    await db._conn.execute("UPDATE tickets SET attempts = 2 WHERE id = 't1'")
+    never = asyncio.Event()
+
+    async def hangs(prompt):
+        await never.wait()
+        return VALID
+
+    settings = replace(settings, llm_timeout_s=0.01)
+    ctx, _ = make_ctx(db, settings, clock, [hangs])
+
+    assert await run_once(ctx) is True
+
+    row = await db.get_ticket("t1")
+    assert row.status == "failed"
+    assert row.attempts == 3
+    assert row.last_error == "timeout after 0.01s"
+    assert row.held_by is None
+    assert row.next_attempt_at is None
+
+
+async def test_unexpected_llm_error_is_retried_and_logged_once(
+    db, settings, clock, caplog
+):
+    caplog.set_level(logging.DEBUG, logger="app.worker")
+    await add(db, clock, id_="a")
+    await add(db, clock, id_="b")
+    ctx, _ = make_ctx(
+        db, settings, clock, [RuntimeError("boom"), ValueError("x" * 500)]
+    )
+
+    assert await run_once(ctx) is True
+    assert await run_once(ctx) is True
+
+    a = await db.get_ticket("a")
+    assert a.status == "pending"
+    assert a.attempts == 1
+    assert a.last_error == "unexpected error: RuntimeError: boom"
+    assert a.held_by is None
+    assert a.next_attempt_at > clock()
+    b = await db.get_ticket("b")
+    assert b.last_error.startswith("unexpected error: ValueError: xxx")
+    assert len(b.last_error) <= 200
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 2
+    assert all(r.exc_info for r in errors)
+
+
+async def test_expected_llm_failures_log_no_errors(db, settings, clock, caplog):
+    caplog.set_level(logging.DEBUG, logger="app.worker")
+    await add(db, clock, id_="a")
+    await add(db, clock, id_="b")
+    never = asyncio.Event()
+
+    async def hangs(prompt):
+        await never.wait()
+        return VALID
+
+    settings = replace(settings, llm_timeout_s=0.01)
+    ctx, _ = make_ctx(db, settings, clock, [LLMPermanentError("rejected"), hangs])
+
+    assert await run_once(ctx) is True
+    assert await run_once(ctx) is True
+
+    assert (await db.get_ticket("a")).status == "failed"
+    assert (await db.get_ticket("b")).last_error == "timeout after 0.01s"
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+async def test_lost_lease_discards_result(db, settings, clock):
+    await add(db, clock)
+    never = asyncio.Event()
+    cancelled = []
+
+    async def stolen_then_blocks(prompt):
+        await steal(db)
+        # Only the heartbeat's on_lost can end this call: it never returns by itself.
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return VALID
+
+    ctx, _ = make_ctx(db, settings, clock, [stolen_then_blocks])
+
+    assert await asyncio.wait_for(run_once(ctx), 1) is True
+
+    row = await db.get_ticket("t1")
+    assert cancelled == [True]
+    assert row.status == "pending"
     assert row.category is None
     assert row.held_by == "other"
     assert row.last_error is None
     assert row.attempts == 1
-    assert finished == []
 
 
 async def test_heartbeat_renews(db, settings, clock):

@@ -51,15 +51,28 @@ async def heartbeat(
             return
 
 
-async def _stop_tasks(*tasks: asyncio.Task) -> None:
-    """Cancel every task, then wait until all have really finished, without raising
-    their outcomes here. Only a cancellation of the caller itself propagates."""
-    for task in tasks:
-        task.cancel()
-    await asyncio.wait(tasks)
-    for task in tasks:
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("background task failed", exc_info=task.exception())
+async def _stop_attempt(llm_task: asyncio.Task, hb_task: asyncio.Task) -> None:
+    """Cancel both tasks, then wait until both have really finished, without raising
+    their outcomes here. Only a cancellation of the caller itself propagates.
+
+    The LLM task's outcome belongs to the caller, which awaited it and handles it;
+    only a crashed heartbeat is reported here.
+    """
+    llm_task.cancel()
+    hb_task.cancel()
+    await asyncio.wait((llm_task, hb_task))
+    if not hb_task.cancelled() and hb_task.exception() is not None:
+        logger.error("heartbeat failed", exc_info=hb_task.exception())
+
+
+_MAX_ERROR_CHARS = 200
+
+
+def _unexpected_error(e: Exception) -> str:
+    text = f"unexpected error: {type(e).__name__}: {e}"
+    if len(text) > _MAX_ERROR_CHARS:
+        text = text[: _MAX_ERROR_CHARS - 1] + "…"
+    return text
 
 
 async def _call_llm(ctx: WorkerContext, row: TicketRow) -> str:
@@ -100,7 +113,7 @@ async def _process(ctx: WorkerContext, row: TicketRow, token: str) -> None:
             text = await llm_task
         finally:
             # Before any write, so the heartbeat never sees our own save as a lost lease.
-            await _stop_tasks(llm_task, hb_task)
+            await _stop_attempt(llm_task, hb_task)
     except asyncio.CancelledError:
         me = asyncio.current_task()
         if lost and (me is None or me.cancelling() == 0):
@@ -121,6 +134,11 @@ async def _process(ctx: WorkerContext, row: TicketRow, token: str) -> None:
         error = f"llm permanent error: {e}"
         logger.warning("ticket %s: %s", row.id, error)
         written = await ctx.db.mark_failed(row.id, token, error=error, now=ctx.clock())
+    except Exception as e:
+        # A buggy client is treated as retryable; CancelledError is a BaseException
+        # and never lands here.
+        logger.exception("ticket %s: unexpected error from LLM client", row.id)
+        written = await _retry_or_fail(ctx, row, token, _unexpected_error(e))
     else:
         try:
             classification = validate_reply(text)
