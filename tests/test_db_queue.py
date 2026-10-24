@@ -307,13 +307,25 @@ async def test_sweep_fails_dead_final_attempt(db, clock):
     assert await db.sweep_exhausted(now=clock(), max_attempts=MAX) == 0
 
 
-async def test_sweep_ignores_unheld_capped_and_finished(db, clock):
+async def test_sweep_fails_unheld_capped_and_ignores_finished(db, clock):
+    # Released for retry at the cap, then MAX_ATTEMPTS lowered by a restart:
+    # pending, unheld, capped rows can never be claimed, so the sweep fails them.
     await add(db, "unheld", clock(), attempts=MAX)
     await add(db, "done", clock(), status="classified", attempts=MAX,
               held_until=clock() - 100)
-    before = {i: await db.get_ticket(i) for i in ("unheld", "done")}
-    assert await db.sweep_exhausted(now=clock(), max_attempts=MAX) == 0
+    await add(db, "failed", clock(), status="failed", attempts=MAX)
+    before = {i: await db.get_ticket(i) for i in ("done", "failed")}
+    clock.advance(1)
+    assert await db.sweep_exhausted(now=clock(), max_attempts=MAX) == 1
+    unheld = await db.get_ticket("unheld")
+    assert unheld.status == "failed"
+    assert unheld.last_error == "attempt limit reached"
+    assert unheld.held_by is None
+    assert unheld.held_until is None
+    assert unheld.attempts == MAX
+    assert unheld.updated_at == clock()
     assert {i: await db.get_ticket(i) for i in before} == before
+    assert await db.sweep_exhausted(now=clock(), max_attempts=MAX) == 0
 
 
 async def test_release_on_shutdown_gives_attempt_back(db, clock):

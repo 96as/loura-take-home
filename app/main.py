@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 import time
 from collections.abc import Callable
@@ -56,4 +57,9 @@ def create_app(
     return app
 
 
+# Plain `uvicorn app.main:app` configures no handlers for our loggers, so the
+# worker's INFO lines (retries, failures, lost leases) would otherwise vanish.
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 app = create_app()

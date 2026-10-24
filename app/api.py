@@ -7,7 +7,7 @@ import json
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import APIRouter, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -68,7 +68,13 @@ def _error_response(
 def _validation_message(exc: RequestValidationError) -> str:
     parts = []
     for err in exc.errors():
-        loc = [str(p) for p in err["loc"] if p not in ("body", "query")]
+        if err["type"] == "json_invalid":
+            parts.append("request body is not valid JSON")
+            continue
+        loc = list(err["loc"])
+        if loc and loc[0] in ("body", "query"):  # only the source, not a field named "body"
+            loc = loc[1:]
+        loc = [str(p) for p in loc]
         msg = err["msg"].removeprefix("Value error, ")
         parts.append(f"{'.'.join(loc)}: {msg}" if loc else msg)
     return "; ".join(parts) or "invalid request"

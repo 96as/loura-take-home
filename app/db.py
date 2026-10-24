@@ -263,14 +263,18 @@ class Database:
         )
 
     async def sweep_exhausted(self, *, now: float, max_attempts: int) -> int:
-        # Not fenced: it targets rows whose holder died during the final
-        # attempt, which claim_next will never pick up again.
+        # Not fenced: it targets pending rows at the attempt cap that
+        # claim_next will never pick up again: the holder died during the
+        # final attempt (expired lease), or the row was released for retry
+        # and the cap was lowered by a restart (unheld). A live lease is left alone.
         cur = await self._conn.execute(
             "UPDATE tickets SET status = 'failed', "
-            "last_error = 'worker stopped during final attempt', "
+            "last_error = CASE WHEN held_until IS NULL "
+            "THEN 'attempt limit reached' "
+            "ELSE 'worker stopped during final attempt' END, "
             "held_by = NULL, held_until = NULL, updated_at = :now "
             "WHERE status = 'pending' AND attempts >= :max "
-            "AND held_until IS NOT NULL AND held_until < :now",
+            "AND (held_until IS NULL OR held_until < :now)",
             {"now": now, "max": max_attempts},
         )
         count = cur.rowcount

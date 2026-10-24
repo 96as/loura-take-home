@@ -95,8 +95,19 @@ async def test_post_invalid_422_uniform_shape(client):
     ):
         r = await client.post("/tickets", json=payload)
         assert_error(r, 422, "validation_error")
+    # the field literally named "body" keeps its name in the message
+    r = await client.post("/tickets", json={"id": "x"})
+    assert "body" in r.json()["error"]["message"]
     r = await client.post("/tickets", content=b"not json")
     assert_error(r, 422, "validation_error")
+
+
+async def test_post_malformed_json_message(client):
+    r = await client.post(
+        "/tickets", content=b'{"id": ', headers={"content-type": "application/json"}
+    )
+    assert_error(r, 422, "validation_error")
+    assert r.json()["error"]["message"] == "request body is not valid JSON"
 
 
 async def test_concurrent_duplicate_posts(client):

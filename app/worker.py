@@ -122,8 +122,10 @@ async def _process(ctx: WorkerContext, row: TicketRow, token: str) -> None:
             logger.warning("ticket %s: lease lost during LLM call, result discarded", row.id)
             return
         # The worker itself is being stopped: give the unfinished attempt back.
-        await ctx.db.release_on_shutdown(row.id, token, now=ctx.clock())
-        logger.info("ticket %s: released on shutdown", row.id)
+        if await ctx.db.release_on_shutdown(row.id, token, now=ctx.clock()):
+            logger.info("ticket %s: released on shutdown", row.id)
+        else:
+            logger.info("ticket %s: lease already gone at shutdown", row.id)
         raise
     except TimeoutError:
         error = f"timeout after {ctx.settings.llm_timeout_s:g}s"
