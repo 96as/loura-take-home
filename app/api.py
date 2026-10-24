@@ -126,10 +126,14 @@ def decode_cursor(cursor: str) -> tuple[float, str]:
         and len(value) == 2
         and isinstance(value[0], (int, float))
         and not isinstance(value[0], bool)
-        and math.isfinite(value[0])
         and isinstance(value[1], str)
     ):
-        return float(value[0]), value[1]
+        try:
+            created_at = float(value[0])  # OverflowError for absurdly large ints
+        except (OverflowError, ValueError, TypeError):
+            created_at = math.nan
+        if math.isfinite(created_at):
+            return created_at, value[1]
     raise ApiError(422, "invalid_cursor", "cursor is not valid")
 
 

@@ -210,6 +210,8 @@ async def test_list_rejects_bad_params(client):
         b64('[true, "a"]'),
         b64('[1.5, "a", "b"]'),
         b64("not json"),
+        b64("[1" + "0" * 400 + ', "a"]'),
+        b64('[NaN, "a"]'),
         "%%%",
     ):
         r = await client.get("/tickets", params={"cursor": cursor})
@@ -221,3 +223,17 @@ async def test_cursor_round_trip_shape(client, app, clock):
     page = (await client.get("/tickets", params={"limit": 2})).json()
     raw = json.loads(base64.urlsafe_b64decode(page["next_cursor"]))
     assert raw[1] == page["items"][-1]["id"] and isinstance(raw[0], float)
+
+
+async def test_unexpected_error_uniform_500(app, monkeypatch):
+    async def boom(ticket_id):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(app.state.db, "get_ticket", boom)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        r = await c.get("/tickets/t-1")
+    assert_error(r, 500, "internal_error")
+    assert "kaboom" not in r.text
