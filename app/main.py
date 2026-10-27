@@ -21,7 +21,7 @@ def create_app(
     llm: LLMClient | None = None,
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
-    settings = settings or Settings.from_env()
+    settings = settings or Settings.load()
     llm = llm or FakeLLM(settings.fake_llm_failure_rate, settings.fake_llm_seed)
 
     @asynccontextmanager

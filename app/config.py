@@ -4,6 +4,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from dotenv import dotenv_values
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -16,6 +18,12 @@ class Settings:
     max_attempts: int = 3
     fake_llm_failure_rate: float = 0.25
     fake_llm_seed: int | None = None
+
+    @classmethod
+    def load(cls, dotenv_path: str | os.PathLike[str] = ".env") -> Settings:
+        """Settings from an optional .env file; real environment variables win."""
+        file_values = {k: v for k, v in dotenv_values(dotenv_path).items() if v is not None}
+        return cls.from_env({**file_values, **os.environ})
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> Settings:

@@ -84,6 +84,10 @@ that is shown rather than hidden.
 
 ### Settings (environment variables)
 
+All settings are optional; every one has a default, so the steps above need no `.env`. To change
+them, copy [`.env.example`](.env.example) to `.env` and edit it, or set them in the shell
+(`WORKER_COUNT=1 uvicorn app.main:app`). Shell variables win over `.env`.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `DB_PATH` | `tickets.db` | SQLite file (created on start) |
